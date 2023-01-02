@@ -3,19 +3,21 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/hashicorp/mdns"
+	"github.com/grandcat/zeroconf"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
-	"io"
+	"context"
 )
 
 var (
 	serviceName = "_test_message._tcp"
-	message string
+	message     string
 )
 
 var port int
@@ -45,52 +47,44 @@ func echoServer() {
 func server() {
 	echoServer()
 
-	host, err := os.Hostname()
-	if err != nil {
-		log.Fatalf("hostname: %v\n", err)
-	}
+	server, err := zeroconf.Register("GoZeroconf", serviceName, "local.", port, []string{"txtv=0", "lo=1", "la=2"}, nil)
 
-	info := []string { "Example HTTP service" }
-	service, err := mdns.NewMDNSService(host, serviceName, "", "", port, nil, info)
 	if err != nil {
 		log.Fatalf("new mDNS service: %v\n", err)
 	}
-
-	server, err := mdns.NewServer(&mdns.Config{Zone: service})
-	if err != nil {
-		log.Fatalf("new server: %v\n", err)
-	}
 	defer server.Shutdown()
 
-	select {}
-}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
-func connect(service *mdns.ServiceEntry) {
-	target := fmt.Sprintf("http://%s:%d", service.AddrV4, service.Port)
-	response, err := http.Get(target)
-	if err != nil {
-		log.Println("failed to connect to", target, "due to", err)
-		return
-	}
-
-	fmt.Printf("%s: ", target)
-	_, err = io.Copy(os.Stdout, response.Body)
-	if err != nil {
-		log.Println("failed to read response:", err)
-		return
+	select {
+	case <-sig:
 	}
 }
 
 func client() {
-	services := make(chan *mdns.ServiceEntry, 32)
-	go func() {
-		mdns.Lookup(serviceName, services)
-		close(services)
-	}()
-
-	for service := range services {
-		connect(service)
+	resolver, err := zeroconf.NewResolver(nil)
+	if err != nil {
+		log.Fatalln("Failed to initialize resolver:", err)
+		return
 	}
+
+	entries := make(chan *zeroconf.ServiceEntry)
+	go func(results <-chan *zeroconf.ServiceEntry) {
+		for entry := range results {
+			log.Println(entry)
+		}
+		log.Println("Entries exhausted")
+	}(entries)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second * 10)
+	defer cancel()
+
+	err = resolver.Browse(ctx, serviceName, "local.", entries)
+	if err != nil {
+		log.Fatalln("Failed to browse:", err)
+	}
+	<-ctx.Done()
 }
 
 func main() {
@@ -99,7 +93,6 @@ func main() {
 	listen := flag.Bool("listen", false, "Create mDNS service that listens for HTTP messages")
 	flag.StringVar(&message, "message", "", "Create mDNS service that listens for HTTP messages")
 	flag.Parse()
-
 
 	if *listen {
 		if len(message) == 0 {
